@@ -1,15 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:momo_wallet/main.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
-  TestWidgetsFlutterBinding.ensureInitialized();
-
-  // Fake storage for tests, so saving works without a phone.
-  setUp(() {
-    SharedPreferences.setMockInitialValues({});
-  });
-
   test('starts at 10,000 RWF with sample transactions', () {
     final w = Wallet();
     expect(w.balance, 10000);
@@ -68,5 +60,16 @@ void main() {
     final gift = w.history.last;
     w.cashOut('100000');
     expect(w.checkDelete(gift), isNotNull);
+  });
+
+  test('edit rules', () {
+    final w = Wallet();
+    final fromMama = w.history[1]; // IN 3000
+    expect(w.checkEdit(fromMama, '', '3000'), 'Description cannot be empty');
+    expect(w.checkEdit(fromMama, 'From Mama', 'abc'), isNotNull);
+    expect(w.checkEdit(fromMama, 'From Mama', '5000'), isNull);
+    // Making a big OUT would take the balance below 0
+    final airtime = w.history.first;
+    expect(w.checkEdit(airtime, 'Airtime', '20000'), isNotNull);
   });
 }

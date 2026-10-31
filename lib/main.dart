@@ -1,14 +1,25 @@
 import 'dart:async';
 import 'dart:convert';
 
+// Firestore has its own class called Transaction: hide it, we use ours.
+import 'package:cloud_firestore/cloud_firestore.dart' hide Transaction;
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
-import 'package:shared_preferences/shared_preferences.dart';
+
+import 'auth_gate.dart';
+import 'cloud.dart';
+import 'firebase_options.dart';
 
 // ===================== main.dart =====================
 
-
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  // Android reads android/app/google-services.json by itself.
+  // Chrome (web) needs the settings from firebase_options.dart.
+  await Firebase.initializeApp(options: kIsWeb ? webOptions : null);
   runApp(const MyApp());
 }
 
@@ -24,7 +35,7 @@ class MyApp extends StatelessWidget {
         colorSchemeSeed: const Color(0xFF00796B),
         useMaterial3: true,
       ),
-      home: const WalletScreen(),
+      home: const AuthGate(),
     );
   }
 }
@@ -55,12 +66,14 @@ String shortDate(DateTime d) {
 /// One movement of money in the wallet.
 class Transaction {
   Transaction({
+    this.id = '',
     required this.description,
     required this.amount,
     required this.isIn,
     required this.time,
   });
 
+  final String id; // the Firestore document id ('' before it is saved)
   final String description;
   final int amount; // always positive
   final bool isIn; // true = money came in, false = money went out
@@ -69,29 +82,39 @@ class Transaction {
   /// +amount for IN, -amount for OUT. Makes adding up the balance easy.
   int get signedAmount => isIn ? amount : -amount;
 
-  /// Turns the transaction into a Map so it can be saved as JSON text.
-  Map<String, dynamic> toJson() => {
+  /// The facts the user typed or chose. The time is added when saving.
+  Map<String, dynamic> toMap() => {
     'description': description,
     'amount': amount,
     'isIn': isIn,
-    'time': time.toIso8601String(),
   };
 
-  /// Builds a transaction back from a saved Map.
-  factory Transaction.fromJson(Map<String, dynamic> json) => Transaction(
-    description: json['description'] as String,
-    amount: json['amount'] as int,
-    isIn: json['isIn'] as bool,
-    time: DateTime.parse(json['time'] as String),
-  );
+  /// Builds a transaction from a Firestore document.
+  factory Transaction.fromDoc(DocumentSnapshot<Map<String, dynamic>> doc) {
+    final data = doc.data()!;
+    return Transaction(
+      id: doc.id,
+      description: data['description'] as String,
+      amount: (data['amount'] as num).toInt(),
+      isIn: data['isIn'] as bool,
+      // Just after adding, the server has not written the time yet: use now.
+      time: (data['createdAt'] as Timestamp?)?.toDate() ?? DateTime.now(),
+    );
+  }
 }
 
 // ===================== models/wallet.dart =====================
 
 /// The brain of the app: the data and every rule. No widgets here.
 class Wallet {
+  /// A wallet with the sample transactions (used by the tests).
   Wallet() {
-    _addSampleTransactions();
+    history.addAll(sampleTransactions());
+  }
+
+  /// A wallet built from the transactions that came from Firestore.
+  Wallet.from(List<Transaction> transactions) {
+    history.addAll(transactions);
   }
 
   static const int openingBalance = 10000;
@@ -101,35 +124,10 @@ class Wallet {
   /// Every transaction, OLDEST first (the order they happened).
   final List<Transaction> history = [];
 
-  static const String storageKey = 'transactions';
-
-  // ---------------------------------------------------------------- saving (shared_preferences)
-
-  /// Loads the saved history. On the very first run nothing is saved yet,
-  /// so the sample transactions stay and are saved.
-  Future<void> load() async {
-    final prefs = await SharedPreferences.getInstance();
-    final saved = prefs.getString(storageKey);
-    if (saved == null) {
-      await save();
-      return;
-    }
-    final list = jsonDecode(saved) as List<dynamic>;
-    history
-      ..clear()
-      ..addAll(list.map((item) => Transaction.fromJson(item as Map<String, dynamic>)));
-  }
-
-  /// Saves the whole history as one JSON text.
-  Future<void> save() async {
-    final prefs = await SharedPreferences.getInstance();
-    final text = jsonEncode(history.map((t) => t.toJson()).toList());
-    await prefs.setString(storageKey, text);
-  }
-
-  void _addSampleTransactions() {
+  /// The sample data a new account starts with.
+  static List<Transaction> sampleTransactions() {
     final now = DateTime.now();
-    history.addAll([
+    return [
       Transaction(
         description: 'Airtime',
         amount: 1000,
@@ -148,7 +146,7 @@ class Wallet {
         isIn: false,
         time: now.subtract(const Duration(days: 1, hours: 1)),
       ),
-    ]);
+    ];
   }
 
   // ---------------------------------------------------------------- numbers
@@ -272,7 +270,6 @@ class Wallet {
       isIn: true,
       time: DateTime.now(),
     ));
-    save();
     return null;
   }
 
@@ -285,7 +282,6 @@ class Wallet {
       isIn: false,
       time: DateTime.now(),
     ));
-    save();
     return null;
   }
 
@@ -298,25 +294,56 @@ class Wallet {
       isIn: false,
       time: DateTime.now(),
     ));
-    save();
     return null;
   }
 
   // ---------------------------------------------------------------- delete & undo
 
+  /// True when [a] and [b] are the same transaction (same Firestore id).
+  static bool _same(Transaction a, Transaction b) =>
+      identical(a, b) || (a.id.isNotEmpty && a.id == b.id);
+
   String? checkDelete(Transaction t) {
-    final without = List.of(history)..remove(t);
+    final without = history.where((x) => !_same(x, t)).toList();
     if (lowestRunningBalance(without) < 0) {
       return "Can't delete: the balance would go below 0 in the history";
     }
     return null;
   }
 
+  /// Undo after a delete: is it safe to put [t] back at its own time?
+  String? checkRestore(Transaction t) {
+    final withIt = [...history, t]..sort((a, b) => a.time.compareTo(b.time));
+    if (lowestRunningBalance(withIt) < 0) {
+      return "Can't undo: the balance would go below 0";
+    }
+    return null;
+  }
+
+  /// Edit: checks the new description and amount, and that the balance
+  /// never goes below 0 anywhere in the history after the change.
+  String? checkEdit(Transaction t, String description, String amountText) {
+    if (description.trim().isEmpty) return 'Description cannot be empty';
+    final amountError = checkAmount(amountText);
+    if (amountError != null) return amountError;
+    final changed = Transaction(
+      id: t.id,
+      description: description.trim(),
+      amount: int.parse(amountText.trim()),
+      isIn: t.isIn,
+      time: t.time,
+    );
+    final list = [for (final x in history) _same(x, t) ? changed : x];
+    if (lowestRunningBalance(list) < 0) {
+      return "Can't save: the balance would go below 0 in the history";
+    }
+    return null;
+  }
+
   /// Removes the transaction and returns where it was, for Undo.
   int delete(Transaction t) {
-    final position = history.indexOf(t);
+    final position = history.indexWhere((x) => _same(x, t));
     history.removeAt(position);
-    save();
     return position;
   }
 
@@ -327,7 +354,6 @@ class Wallet {
       return "Can't undo: the balance would go below 0";
     }
     history.insert(place, t);
-    save();
     return null;
   }
 }
@@ -343,41 +369,28 @@ class WalletScreen extends StatefulWidget {
 }
 
 class _WalletScreenState extends State<WalletScreen> {
-  final wallet = Wallet();
   String filter = 'All';
-  bool loading = true;
 
-  @override
-  void initState() {
-    super.initState();
-    loadWallet();
-  }
+  /// The live list from Firestore, oldest first. Made once, so changing the
+  /// filter does not reconnect.
+  final _stream = myTransactions().orderBy('createdAt').snapshots();
 
-  /// Reads the saved transactions, then shows them.
-  Future<void> loadWallet() async {
-    await wallet.load();
-    if (!mounted) return;
-    setState(() {
-      loading = false;
-    });
-  }
+  /// The wallet built from the latest data that arrived.
+  Wallet _wallet = Wallet.from([]);
 
   void showMessage(String message) {
     ScaffoldMessenger.of(context).hideCurrentSnackBar();
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
   }
 
-  /// Opens a screen. When it comes back with a message, the money moved:
-  /// redraw and show the message.
+  /// Opens a screen. When it comes back with a message, show it.
+  /// No setState for the data: Firestore sends the new list by itself.
   void openScreen(Widget screen) {
     Navigator.push(
       context,
       MaterialPageRoute(builder: (context) => screen),
     ).then((result) {
-      if (result is String) {
-        setState(() {});
-        showMessage(result);
-      }
+      if (result is String) showMessage(result);
     });
   }
 
@@ -387,17 +400,40 @@ class _WalletScreenState extends State<WalletScreen> {
       MaterialPageRoute(builder: (context) => TransactionScreen(transaction: t)),
     ).then((result) {
       if (result == 'delete') deleteTransaction(t);
+      if (result == 'edit') {
+        openScreen(EditTransactionScreen(wallet: _wallet, transaction: t));
+      }
     });
   }
 
-  void deleteTransaction(Transaction t) {
-    final error = wallet.checkDelete(t);
+  /// Hold (or the Delete button): Are you sure? Then delete it in Firestore,
+  /// with Undo that writes the same data back.
+  Future<void> deleteTransaction(Transaction t) async {
+    final error = _wallet.checkDelete(t);
     if (error != null) {
       showMessage(error);
       return;
     }
-    final position = wallet.delete(t);
-    setState(() {});
+    final sure = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete this transaction?'),
+        content: Text('${t.description}  ${t.isIn ? '+' : '-'}${money(t.amount)}'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(context, true), child: const Text('Delete')),
+        ],
+      ),
+    );
+    if (sure != true) return;
+
+    try {
+      await myTransactions().doc(t.id).delete();
+    } catch (e) {
+      if (mounted) showMessage('Could not delete. Check your internet.');
+      return;
+    }
+    if (!mounted) return;
     ScaffoldMessenger.of(context).hideCurrentSnackBar();
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
@@ -405,9 +441,12 @@ class _WalletScreenState extends State<WalletScreen> {
         action: SnackBarAction(
           label: 'Undo',
           onPressed: () {
-            final undoError = wallet.undoDelete(position, t);
-            setState(() {});
-            if (undoError != null) showMessage(undoError);
+            final undoError = _wallet.checkRestore(t);
+            if (undoError != null) {
+              showMessage(undoError);
+              return;
+            }
+            restoreTransaction(t); // doc(id).set(...) with the same data
           },
         ),
       ),
@@ -416,18 +455,55 @@ class _WalletScreenState extends State<WalletScreen> {
 
   @override
   Widget build(BuildContext context) {
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: _stream,
+      builder: (context, snapshot) {
+        // Error state: for example, the rules refused.
+        if (snapshot.hasError) {
+          return Scaffold(
+            appBar: AppBar(title: const Text('Amafaranga'), actions: [logoutButton()]),
+            body: Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Text(
+                  'Could not load your transactions.\n${snapshot.error}',
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            ),
+          );
+        }
+        // Loading state: nothing has arrived yet.
+        if (!snapshot.hasData) {
+          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        }
+        // Data: every document becomes a Transaction; balance and totals
+        // are computed from them every time.
+        final txns = snapshot.data!.docs.map(Transaction.fromDoc).toList();
+        _wallet = Wallet.from(txns);
+        return buildWallet(context, _wallet);
+      },
+    );
+  }
+
+  Widget logoutButton() {
+    return IconButton(
+      icon: const Icon(Icons.logout),
+      tooltip: 'Log out',
+      onPressed: () => FirebaseAuth.instance.signOut(),
+    );
+  }
+
+  Widget buildWallet(BuildContext context, Wallet wallet) {
     final shown = wallet.shown(filter);
     final scheme = Theme.of(context).colorScheme;
-
-    if (loading) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
-    }
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('Amafaranga'),
         centerTitle: true,
         actions: [
+          logoutButton(),
           IconButton(
             tooltip: 'Live exchange rates',
             icon: const Icon(Icons.currency_exchange),
@@ -544,8 +620,12 @@ class _WalletScreenState extends State<WalletScreen> {
           Expanded(
             child: shown.isEmpty
                 ? Center(
+              // Empty state: a friendly message, not a blank screen.
               child: Text(
-                filter == 'All' ? 'No transactions yet' : 'No $filter transactions',
+                filter == 'All'
+                    ? 'No transactions yet.\nTap Receive to add your first one.'
+                    : 'No $filter transactions',
+                textAlign: TextAlign.center,
                 style: TextStyle(color: Colors.grey.shade600, fontSize: 16),
               ),
             )
@@ -662,13 +742,20 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
     super.dispose();
   }
 
-  void receive() {
+  bool busy = false;
+
+  Future<void> receive() async {
     final error = widget.wallet.receive(descriptionController.text, amountController.text);
     if (error != null) {
       ScaffoldMessenger.of(context).hideCurrentSnackBar();
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error)));
       return;
     }
+    setState(() => busy = true);
+    final saved = await saveNew(context, widget.wallet);
+    if (!mounted) return;
+    setState(() => busy = false);
+    if (!saved) return;
     final amount = int.parse(amountController.text.trim());
     Navigator.pop(context, 'Received ${money(amount)}');
   }
@@ -702,7 +789,7 @@ class _ReceiveScreenState extends State<ReceiveScreen> {
           ),
           const SizedBox(height: 24),
           FilledButton.icon(
-            onPressed: receive,
+            onPressed: busy ? null : receive,
             icon: const Icon(Icons.south_west),
             label: const Text('Receive'),
           ),
@@ -735,13 +822,20 @@ class _SendScreenState extends State<SendScreen> {
     super.dispose();
   }
 
-  void send() {
+  bool busy = false;
+
+  Future<void> send() async {
     final error = widget.wallet.send(phoneController.text, amountController.text);
     if (error != null) {
       ScaffoldMessenger.of(context).hideCurrentSnackBar();
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error)));
       return;
     }
+    setState(() => busy = true);
+    final saved = await saveNew(context, widget.wallet);
+    if (!mounted) return;
+    setState(() => busy = false);
+    if (!saved) return;
     final amount = int.parse(amountController.text.trim());
     Navigator.pop(context, 'Sent ${money(amount)} to ${phoneController.text.trim()}');
   }
@@ -778,7 +872,7 @@ class _SendScreenState extends State<SendScreen> {
           ),
           const SizedBox(height: 24),
           FilledButton.icon(
-            onPressed: send,
+            onPressed: busy ? null : send,
             icon: const Icon(Icons.send),
             label: const Text('Send'),
           ),
@@ -826,12 +920,19 @@ class _CashOutScreenState extends State<CashOutScreen> {
     });
   }
 
-  void confirm() {
+  bool busy = false;
+
+  Future<void> confirm() async {
     final error = widget.wallet.cashOut(amountController.text);
     if (error != null) {
       showMessage(error);
       return;
     }
+    setState(() => busy = true);
+    final saved = await saveNew(context, widget.wallet);
+    if (!mounted) return;
+    setState(() => busy = false);
+    if (!saved) return;
     final amount = int.parse(amountController.text.trim());
     Navigator.pop(context, 'Cashed out ${money(amount)}');
   }
@@ -891,7 +992,7 @@ class _CashOutScreenState extends State<CashOutScreen> {
               ),
             const SizedBox(height: 16),
             FilledButton.icon(
-              onPressed: confirm,
+              onPressed: busy ? null : confirm,
               icon: const Icon(Icons.check),
               label: const Text('Confirm'),
             ),
@@ -939,6 +1040,12 @@ class TransactionScreen extends StatelessWidget {
           ListTile(leading: const Icon(Icons.swap_vert), title: const Text('Type'), subtitle: Text(t.isIn ? 'IN' : 'OUT')),
           ListTile(leading: const Icon(Icons.schedule), title: const Text('Date'), subtitle: Text(shortDate(t.time))),
           const SizedBox(height: 24),
+          FilledButton.icon(
+            onPressed: () => Navigator.pop(context, 'edit'),
+            icon: const Icon(Icons.edit),
+            label: const Text('Edit'),
+          ),
+          const SizedBox(height: 8),
           OutlinedButton.icon(
             onPressed: () => Navigator.pop(context, 'delete'),
             icon: const Icon(Icons.delete_outline),
@@ -951,6 +1058,101 @@ class TransactionScreen extends StatelessWidget {
   }
 }
 
+
+// ===================== screens/edit_transaction_screen.dart =====================
+
+/// Step 5: the same kind of form, with the transaction already in it.
+/// Saving uses update on that document.
+class EditTransactionScreen extends StatefulWidget {
+  const EditTransactionScreen({super.key, required this.wallet, required this.transaction});
+
+  final Wallet wallet;
+  final Transaction transaction;
+
+  @override
+  State<EditTransactionScreen> createState() => _EditTransactionScreenState();
+}
+
+class _EditTransactionScreenState extends State<EditTransactionScreen> {
+  late final descriptionController = TextEditingController(text: widget.transaction.description);
+  late final amountController = TextEditingController(text: '${widget.transaction.amount}');
+  bool busy = false;
+
+  @override
+  void dispose() {
+    descriptionController.dispose();
+    amountController.dispose();
+    super.dispose();
+  }
+
+  void showMessage(String message) {
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<void> save() async {
+    final t = widget.transaction;
+    final error = widget.wallet.checkEdit(t, descriptionController.text, amountController.text);
+    if (error != null) {
+      showMessage(error);
+      return;
+    }
+    setState(() => busy = true);
+    try {
+      await myTransactions().doc(t.id).update({
+        'description': descriptionController.text.trim(),
+        'amount': int.parse(amountController.text.trim()),
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => busy = false);
+      showMessage('Could not save. Check your internet.');
+      return;
+    }
+    if (!mounted) return;
+    Navigator.pop(context, 'Transaction updated');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final t = widget.transaction;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Edit transaction')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Text(t.isIn ? 'Money IN' : 'Money OUT', style: const TextStyle(fontSize: 16)),
+          const SizedBox(height: 16),
+          TextField(
+            controller: descriptionController,
+            decoration: const InputDecoration(
+              labelText: 'Description',
+              prefixIcon: Icon(Icons.notes),
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 16),
+          TextField(
+            controller: amountController,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(
+              labelText: 'Amount',
+              suffixText: 'RWF',
+              prefixIcon: Icon(Icons.money),
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 24),
+          FilledButton.icon(
+            onPressed: busy ? null : save,
+            icon: const Icon(Icons.save),
+            label: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+  }
+}
 
 // ===================== screens/rates_screen.dart =====================
 
